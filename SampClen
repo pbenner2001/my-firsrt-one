@@ -1,0 +1,635 @@
+#===============================================================
+# SampClen_V1_2_PUBLIC.r
+#
+# Purpose:
+#   R version of SampClen. Splits a fixed-width sample file into
+#   a GOOD file and a BAD file using run-time options (DNC, PCI,
+#   invalid area codes, toll free, AK/HI, Canadian, etc.).
+#   Built for very large files (1.9 million+ phones).
+#
+# Inputs:
+#   1. Fixed-width sample file (.txt or .dat)
+#   2. Sampling Layout Utility report
+#      (typically Printed_Samplay.txt)
+#   3. Lists for the options that are checked:
+#        DNC            dontcall.txt
+#        Wireless DNC   (path selected by user)
+#        PCI Purge      pci purge.TXT
+#        Used file      (path selected by user)
+#        Valid area     AreaCodeListing.TXT
+#        Toll free      800.TXT
+#        AK / HI        akhi.TXT
+#        Canadian       canada.TXT
+#
+# Output (two fixed-width files):
+#   GOOD file   records that passed every check, exactly as read
+#   BAD file    records removed by any check, written as:
+#                 [2-digit reason code][one space][original record]
+#               so every field in the BAD file is pushed right 3
+#               columns. Example (DNC):
+#                 05 6105551212...
+#   The summary (counts by reason) is shown on the screen and in
+#   the R console.
+#
+# Reason codes (first reason that removes a record is used):
+#   01  Invalid digits (phone is not exactly 10 digits)
+#   02  Invalid area code
+#   03  Duplicate within this file
+#   04  Duplicate with previous (used file)
+#   05  DNC / Wireless DNC / PCI Purge
+#   06  Toll free
+#   07  AK / HI
+#   08  Canadian area code
+#   (06-08 are not in the original list; change STEP_CODE below)
+#
+# Rules:
+#   - The phone field position comes from the layout report
+#   - Removal steps run in this order and each record is counted
+#     once, under the FIRST reason that removes it:
+#       1 DNC   2 Wireless DNC   3 PCI   4 Used   5 Invalid numerics
+#       6 Toll free   7 AK/HI   8 Canadian   9 Invalid area codes
+#       10 Duplicates within this file
+#   - Invalid numeric = phone is not exactly 10 digits
+#   - DNC / PCI / Wireless / Used lists: first value on each line
+#     is the phone; non-digits are removed; a leading 1 on an
+#     11-digit number is dropped
+#   - Area-code lists: one 3-digit area code per line
+#   - Duplicates: the first record is kept, later ones removed
+#   - GOOD records are written exactly as read
+#
+# Features:
+#   - Layout driven (no hard-coded positions)
+#   - Always-on-top Tcl/Tk run-time options window
+#   - Large-file friendly: records are streamed in chunks; only
+#     the phone numbers are held in memory
+#
+# Version History:
+#   V1    First R version of SampClen
+#   V1.1  Two outputs: GOOD file and BAD file (fixed-width)
+#   V1.2  Reason code + space added at the start of each BAD record
+#
+# Author:
+#   Phil Benner
+#===============================================================
+
+library(tcltk)
+library(data.table)
+
+#===============================================================
+# CONFIG
+#===============================================================
+SAMPCLEN_DIR        <- "L:/Methods/Sampling/Internal/SampClenFiles"
+PHONE_FIELD_DEFAULT <- "TelephoneNumber"
+
+# TRUE  = records with a blank phone are kept and skipped by every check
+# FALSE = records with a blank phone are removed as invalid numerics
+KEEP_BLANK_PHONES   <- FALSE
+
+CHUNK_REC  <- 250000L    # fixed-width records per read
+CHUNK_LIST <- 2000000L   # list-file lines per read
+
+# Run-time options (same order as the SampClen screen)
+OPTS <- list(
+  list(key = "DNC",  text = "Un-dup against DNC (do not call) file",
+       file = TRUE,  on = TRUE,  path = file.path(SAMPCLEN_DIR, "dontcall.txt")),
+  list(key = "WDNC", text = "Un-dup against Wireless DNC file",
+       file = TRUE,  on = FALSE, path = ""),
+  list(key = "PCI",  text = "Un-dup against Private Citizens file",
+       file = TRUE,  on = TRUE,  path = file.path(SAMPCLEN_DIR, "pci purge.TXT")),
+  list(key = "USED", text = "Un-dup against used file",
+       file = TRUE,  on = FALSE, path = ""),
+  list(key = "NUM",  text = "Remove invalid numerics (always on)",
+       file = FALSE, on = TRUE,  fixed = TRUE),
+  list(key = "DUPS", text = "Remove duplicates within this file",
+       file = FALSE, on = FALSE),
+  list(key = "AREA", text = "Remove invalid area codes",
+       file = TRUE,  on = TRUE,  path = file.path(SAMPCLEN_DIR, "AreaCodeListing.TXT")),
+  list(key = "TF",   text = "Remove Toll Free numbers",
+       file = TRUE,  on = TRUE,  path = file.path(SAMPCLEN_DIR, "800.TXT")),
+  list(key = "AKHI", text = "Remove AK and HI numbers",
+       file = TRUE,  on = FALSE, path = file.path(SAMPCLEN_DIR, "akhi.TXT")),
+  list(key = "CAN",  text = "Remove Canadian Area Codes",
+       file = TRUE,  on = TRUE,  path = file.path(SAMPCLEN_DIR, "canada.TXT"))
+)
+
+# Labels used in the summary
+STEP_LABEL <- c(
+  DNC  = "DNC",
+  WDNC = "Wireless DNC",
+  PCI  = "PCI Purge",
+  USED = "Used file (dup w/ previous)",
+  NUM  = "Invalid digits",
+  TF   = "Toll free",
+  AKHI = "AK/HI",
+  CAN  = "Canadian area code",
+  AREA = "Invalid area code",
+  DUPS = "Duplicate within file"
+)
+
+# 2-digit reason codes written at the start of each BAD record
+STEP_CODE <- c(
+  NUM  = "01",   # invalid digits (not 10 digits)
+  AREA = "02",   # invalid area code
+  DUPS = "03",   # duplicate within this file
+  USED = "04",   # duplicate with previous (used file)
+  DNC  = "05",   # DNC
+  WDNC = "05",   # wireless DNC
+  PCI  = "05",   # PCI purge
+  TF   = "06",   # toll free
+  AKHI = "07",   # AK / HI
+  CAN  = "08"    # Canadian area code
+)
+
+# Order the removal steps are run
+STEP_ORDER <- c("DNC", "WDNC", "PCI", "USED", "NUM",
+                "TF", "AKHI", "CAN", "AREA", "DUPS")
+
+#===============================================================
+# GUI HELPERS
+#===============================================================
+force_topmost <- function(win) {
+  tcl("wm", "attributes", win, "-topmost", TRUE)
+  tkraise(win)
+  tkwm.deiconify(win)
+  try(tcl("focus", win), silent = TRUE)
+  tcl("update")
+}
+
+show_msg <- function(title, msg, icon = "info") {
+  tt <- tktoplevel()
+  tcl("wm", "attributes", tt, "-topmost", TRUE)
+  tkwm.withdraw(tt)
+  tkmessageBox(parent = tt, title = title, message = msg,
+               icon = icon, type = "ok")
+  tkdestroy(tt)
+}
+
+#===============================================================
+# RUN-TIME OPTIONS WINDOW
+#===============================================================
+TYPES_TXT <- "{{Text Files} {.txt .dat .ksm}} {{All Files} *}"
+
+win  <- tktoplevel()
+tkwm.title(win, "SampClen - Run-Time Options")
+done <- tclVar("0")
+
+v_fw     <- tclVar("")
+v_layout <- tclVar("")
+v_good   <- tclVar("")
+v_bad    <- tclVar("")
+v_phone  <- tclVar(PHONE_FIELD_DEFAULT)
+v_study  <- tclVar("NIGHT")
+
+chk_vars  <- list()
+path_vars <- list()
+
+browse_open <- function(var, title, types = TYPES_TXT, after = NULL) {
+  f <- tclvalue(tkgetOpenFile(parent = win, title = title, filetypes = types))
+  if (nzchar(f)) {
+    tclvalue(var) <- f
+    if (!is.null(after)) after(f)
+  }
+}
+
+default_out <- function(fw, tag) {
+  sub("\\.[^.\\\\/]+$", paste0("_", tag, ".txt"), fw)
+}
+
+# ---- Files section ----
+tkgrid(tklabel(win, text = "Files", font = "Helvetica 10 bold"),
+       row = 0, column = 0, columnspan = 3, sticky = "w", padx = 6, pady = 4)
+
+tkgrid(tklabel(win, text = "Fixed-width sample file"),
+       row = 1, column = 0, sticky = "w", padx = 6)
+tkgrid(tkentry(win, textvariable = v_fw, width = 62),
+       row = 1, column = 1, padx = 4, pady = 2)
+tkgrid(tkbutton(win, text = "Browse...", command = function() {
+  browse_open(v_fw, "Select Fixed-Width Sample File",
+              "{{Text Files} {.txt .dat}} {{All Files} *}",
+              after = function(f) {
+                if (!nzchar(trimws(tclvalue(v_good)))) tclvalue(v_good) <- default_out(f, "GOOD")
+                if (!nzchar(trimws(tclvalue(v_bad))))  tclvalue(v_bad)  <- default_out(f, "BAD")
+              })
+}), row = 1, column = 2, padx = 6)
+
+tkgrid(tklabel(win, text = "Sampling Layout Utility report"),
+       row = 2, column = 0, sticky = "w", padx = 6)
+tkgrid(tkentry(win, textvariable = v_layout, width = 62),
+       row = 2, column = 1, padx = 4, pady = 2)
+tkgrid(tkbutton(win, text = "Browse...", command = function() {
+  browse_open(v_layout, "Select Sampling Layout Utility Report (typically Printed_Samplay.txt)",
+              "{{Text Files} {.txt}} {{All Files} *}")
+}), row = 2, column = 2, padx = 6)
+
+tkgrid(tklabel(win, text = "Phone field name in layout"),
+       row = 3, column = 0, sticky = "w", padx = 6)
+tkgrid(tkentry(win, textvariable = v_phone, width = 30),
+       row = 3, column = 1, padx = 4, pady = 2, sticky = "w")
+
+save_row <- function(label, var, row, title, fallback) {
+  tkgrid(tklabel(win, text = label),
+         row = row, column = 0, sticky = "w", padx = 6)
+  tkgrid(tkentry(win, textvariable = var, width = 62),
+         row = row, column = 1, padx = 4, pady = 2)
+  tkgrid(tkbutton(win, text = "Browse...", command = function() {
+    init <- trimws(tclvalue(var))
+    f <- tclvalue(tkgetSaveFile(
+      parent           = win,
+      title            = title,
+      initialfile      = if (nzchar(init)) basename(init) else fallback,
+      defaultextension = ".txt",
+      filetypes        = "{{Text Files} {.txt .dat}} {{All Files} *}"
+    ))
+    if (nzchar(f)) tclvalue(var) <- f
+  }), row = row, column = 2, padx = 6)
+}
+
+save_row("GOOD output file (kept records)", v_good, 4,
+         "Save GOOD Fixed-Width File As", "GOOD.txt")
+save_row("BAD output file (removed records)", v_bad, 5,
+         "Save BAD Fixed-Width File As", "BAD.txt")
+
+# ---- Run-time options section ----
+tkgrid(tklabel(win, text = "Run-Time Options", font = "Helvetica 10 bold"),
+       row = 6, column = 0, columnspan = 3, sticky = "w", padx = 6, pady = 4)
+
+for (i in seq_along(OPTS)) {
+  local({
+    o <- OPTS[[i]]
+    r <- 6L + i
+    cv <- tclVar(if (isTRUE(o$on)) "1" else "0")
+    chk_vars[[o$key]] <<- cv
+
+    if (isTRUE(o$fixed)) {
+      tkgrid(tkcheckbutton(win, text = o$text, variable = cv, state = "disabled"),
+             row = r, column = 0, columnspan = 2, sticky = "w", padx = 6)
+    } else if (!isTRUE(o$file)) {
+      tkgrid(tkcheckbutton(win, text = o$text, variable = cv),
+             row = r, column = 0, columnspan = 2, sticky = "w", padx = 6)
+    } else {
+      pv <- tclVar(o$path)
+      path_vars[[o$key]] <<- pv
+      tkgrid(tkcheckbutton(win, text = o$text, variable = cv),
+             row = r, column = 0, sticky = "w", padx = 6)
+      tkgrid(tkentry(win, textvariable = pv, width = 62),
+             row = r, column = 1, padx = 4, pady = 2)
+      tkgrid(tkbutton(win, text = "Browse...", command = function() {
+        browse_open(pv, paste("Select file:", o$text))
+      }), row = r, column = 2, padx = 6)
+    }
+  })
+}
+
+# ---- Day / night study (sets the Toll Free box) ----
+set_tf <- function(val) {
+  tf_var <- chk_vars[["TF"]]
+  tclvalue(tf_var) <- val
+}
+
+r_study <- 6L + length(OPTS) + 1L
+tkgrid(tklabel(win, text = "Study runs"),
+       row = r_study, column = 0, sticky = "w", padx = 6, pady = 4)
+fr_study <- tkframe(win)
+tkgrid(
+  tkradiobutton(fr_study, text = "Night (remove toll free)",
+                variable = v_study, value = "NIGHT",
+                command = function() set_tf("1")),
+  tkradiobutton(fr_study, text = "Day (keep toll free)",
+                variable = v_study, value = "DAY",
+                command = function() set_tf("0"))
+)
+tkgrid(fr_study, row = r_study, column = 1, sticky = "w", padx = 4)
+
+# ---- Run / Cancel ----
+on_run <- function() {
+  errs <- character(0)
+  fw   <- trimws(tclvalue(v_fw))
+  lay  <- trimws(tclvalue(v_layout))
+  good <- trimws(tclvalue(v_good))
+  bad  <- trimws(tclvalue(v_bad))
+  pf   <- trimws(tclvalue(v_phone))
+
+  if (!nzchar(fw)  || !file.exists(fw))  errs <- c(errs, "Select an existing fixed-width sample file.")
+  if (!nzchar(lay) || !file.exists(lay)) errs <- c(errs, "Select an existing Sampling Layout Utility report.")
+  if (!nzchar(pf))                       errs <- c(errs, "Enter the phone field name.")
+  same <- function(x, y) {
+    normalizePath(x, mustWork = FALSE) == normalizePath(y, mustWork = FALSE)
+  }
+  if (!nzchar(good)) errs <- c(errs, "Select the GOOD output file.")
+  if (!nzchar(bad))  errs <- c(errs, "Select the BAD output file.")
+  if (nzchar(good) && nzchar(bad) && same(good, bad)) {
+    errs <- c(errs, "GOOD and BAD output files must be different files.")
+  }
+  if (nzchar(fw) && ((nzchar(good) && same(good, fw)) || (nzchar(bad) && same(bad, fw)))) {
+    errs <- c(errs, "Output files cannot be the same as the input file.")
+  }
+
+  for (o in OPTS) {
+    if (isTRUE(o$file) && as.integer(tclvalue(chk_vars[[o$key]])) == 1L) {
+      p <- trimws(tclvalue(path_vars[[o$key]]))
+      if (!nzchar(p) || !file.exists(p)) {
+        errs <- c(errs, paste0("File not found for: ", o$text))
+      }
+    }
+  }
+
+  if (length(errs) > 0) {
+    tkmessageBox(parent = win, title = "SampClen", icon = "error", type = "ok",
+                 message = paste(errs, collapse = "\n"))
+    return(invisible(NULL))
+  }
+
+  tclvalue(done) <- "1"
+  tkdestroy(win)
+}
+
+on_cancel <- function() {
+  tclvalue(done) <- "2"
+  tkdestroy(win)
+}
+
+r_btn <- r_study + 1L
+fr_btn <- tkframe(win)
+tkgrid(tkbutton(fr_btn, text = "Run",    width = 12, command = on_run),
+       tkbutton(fr_btn, text = "Cancel", width = 12, command = on_cancel),
+       padx = 8)
+tkgrid(fr_btn, row = r_btn, column = 0, columnspan = 3, pady = 10)
+
+tcl("wm", "protocol", win, "WM_DELETE_WINDOW", on_cancel)
+force_topmost(win)
+tkwait.variable(done)
+
+if (tclvalue(done) != "1") stop("Cancelled.")
+
+#===============================================================
+# COLLECT SETTINGS
+#===============================================================
+fw_file     <- trimws(tclvalue(v_fw))
+layout_file <- trimws(tclvalue(v_layout))
+good_file   <- trimws(tclvalue(v_good))
+bad_file    <- trimws(tclvalue(v_bad))
+phone_field <- trimws(tclvalue(v_phone))
+
+cfg <- setNames(
+  lapply(OPTS, function(o) {
+    list(
+      on   = as.integer(tclvalue(chk_vars[[o$key]])) == 1L,
+      path = if (isTRUE(o$file)) trimws(tclvalue(path_vars[[o$key]])) else ""
+    )
+  }),
+  vapply(OPTS, function(o) o$key, "")
+)
+
+cat("\nRun-time options:\n")
+for (o in OPTS) {
+  cat(sprintf("  [%s] %s\n", if (cfg[[o$key]]$on) "X" else " ", o$text))
+}
+
+#===============================================================
+# READ LAYOUT (Sampling Layout Utility report)
+#
+# Expected line format:
+#   1 TelephoneNumber   10   1-10   __________
+#===============================================================
+cat("\nReading layout...\n")
+
+layout_lines <- readLines(layout_file, warn = FALSE)
+if (length(layout_lines) == 0) stop("Layout report is empty.")
+
+layout_pattern <-
+  "^\\s*([0-9]+)\\s+([A-Za-z_][^[:space:]]*)\\s+([0-9]+)\\s+([0-9]+)-([0-9]+)(\\s|$)"
+
+hits <- regmatches(layout_lines, regexec(layout_pattern, layout_lines))
+hits <- hits[lengths(hits) == 7]
+
+if (length(hits) == 0) {
+  stop("No fields found in the layout report. Verify it is a Sampling Layout Utility report.")
+}
+
+layout_df <- data.frame(
+  FieldNumber = as.integer(vapply(hits, `[`, "", 2)),
+  FieldName   = vapply(hits, `[`, "", 3),
+  Length      = as.integer(vapply(hits, `[`, "", 4)),
+  Start       = as.integer(vapply(hits, `[`, "", 5)),
+  End         = as.integer(vapply(hits, `[`, "", 6)),
+  stringsAsFactors = FALSE
+)
+
+layout_df <- layout_df[layout_df$Length == (layout_df$End - layout_df$Start + 1L), ]
+if (nrow(layout_df) == 0) stop("No valid field definitions found in the layout report.")
+
+ph_idx <- match(tolower(phone_field), tolower(layout_df$FieldName))
+if (is.na(ph_idx)) {
+  stop(paste0("Phone field '", phone_field, "' not found in the layout."))
+}
+ph_start <- layout_df$Start[ph_idx]
+ph_end   <- layout_df$End[ph_idx]
+
+cat(sprintf("Phone field: %s  positions %d-%d (length %d)\n",
+            layout_df$FieldName[ph_idx], ph_start, ph_end, ph_end - ph_start + 1L))
+
+#===============================================================
+# PASS 1 - READ ONLY THE PHONE FIELD (streamed)
+#===============================================================
+cat("\nPass 1: reading phones...\n")
+
+read_phones <- function(path, start, end) {
+  con <- file(path, "r")
+  on.exit(close(con), add = TRUE)
+  out <- list()
+  k <- 0L
+  total <- 0
+  repeat {
+    ln <- readLines(con, n = CHUNK_REC, warn = FALSE, encoding = "latin1")
+    if (length(ln) == 0L) break
+    k <- k + 1L
+    out[[k]] <- trimws(substr(ln, start, end))
+    total <- total + length(ln)
+    cat("\r  Records read:", format(total, big.mark = ","))
+  }
+  cat("\n")
+  if (k == 0L) character(0) else unlist(out, use.names = FALSE)
+}
+
+phone <- read_phones(fw_file, ph_start, ph_end)
+
+n <- length(phone)
+if (n == 0L) stop("The fixed-width file is empty.")
+
+is_blank <- !nzchar(phone)
+valid10  <- grepl("^[0-9]{10}$", phone)
+ac       <- substr(phone, 1, 3)
+exempt   <- is_blank & KEEP_BLANK_PHONES
+
+sample_set <- unique(phone[valid10])
+cat("  Records:", format(n, big.mark = ","), "\n")
+cat("  Valid 10-digit phones:", format(sum(valid10), big.mark = ","), "\n")
+
+#===============================================================
+# LIST HELPERS
+#===============================================================
+
+# Area-code list: one 3-digit code per line
+read_codes <- function(path, label) {
+  x <- gsub("[^0-9]", "", readLines(path, warn = FALSE))
+  x <- unique(x[nchar(x) == 3L])
+  if (length(x) == 0L) stop(paste0("No 3-digit area codes found in the ", label, " file."))
+  cat(sprintf("  %-22s %d codes\n", label, length(x)))
+  x
+}
+
+# Phone list: returns the sample phones that appear in the list
+# The list is read in chunks, so very large lists are fine.
+list_hits <- function(path, label) {
+  con <- file(path, "r")
+  on.exit(close(con), add = TRUE)
+  found   <- character(0)
+  n_lines <- 0
+  n_valid <- 0
+  repeat {
+    ln <- readLines(con, n = CHUNK_LIST, warn = FALSE)
+    if (length(ln) == 0L) break
+    n_lines <- n_lines + length(ln)
+    tok <- sub("[,;|\t].*$", "", ln)
+    d   <- gsub("[^0-9]", "", tok)
+    d   <- ifelse(nchar(d) == 11L & substr(d, 1, 1) == "1", substr(d, 2, 11), d)
+    ok  <- nchar(d) == 10L
+    n_valid <- n_valid + sum(ok)
+    h <- d[ok & (d %chin% sample_set)]
+    if (length(h) > 0L) found <- unique(c(found, h))
+  }
+  if (n_valid == 0) {
+    stop(paste0("No 10-digit phones could be read from the ", label,
+                " file. Check the file format."))
+  }
+  cat(sprintf("  %-22s %s lines, %s phones, %s in sample\n",
+              label,
+              format(n_lines, big.mark = ","),
+              format(n_valid, big.mark = ","),
+              format(length(found), big.mark = ",")))
+  found
+}
+
+#===============================================================
+# REMOVAL STEPS
+#===============================================================
+keep        <- rep(TRUE, n)
+reason_code <- character(n)
+counts      <- setNames(rep(NA_integer_, length(STEP_ORDER)), STEP_ORDER)
+
+remove_step <- function(step, flag) {
+  hit <- keep & flag & !exempt
+  reason_code[hit] <<- STEP_CODE[[step]]
+  keep[hit]        <<- FALSE
+  counts[[step]]   <<- sum(hit)
+}
+
+cat("\nReading lists...\n")
+
+for (step in STEP_ORDER) {
+
+  if (!cfg[[step]]$on) next
+
+  if (step %in% c("DNC", "WDNC", "PCI", "USED")) {
+    h <- list_hits(cfg[[step]]$path, STEP_LABEL[[step]])
+    remove_step(step, valid10 & (phone %chin% h))
+    rm(h)
+
+  } else if (step == "NUM") {
+    remove_step(step, !valid10)
+
+  } else if (step == "TF") {
+    codes <- read_codes(cfg$TF$path, "Toll free")
+    remove_step(step, valid10 & (ac %chin% codes))
+
+  } else if (step == "AKHI") {
+    codes <- read_codes(cfg$AKHI$path, "AK/HI")
+    remove_step(step, valid10 & (ac %chin% codes))
+
+  } else if (step == "CAN") {
+    codes <- read_codes(cfg$CAN$path, "Canadian")
+    remove_step(step, valid10 & (ac %chin% codes))
+
+  } else if (step == "AREA") {
+    codes <- read_codes(cfg$AREA$path, "Valid area codes")
+    remove_step(step, valid10 & !(ac %chin% codes))
+
+  } else if (step == "DUPS") {
+    d   <- rep(FALSE, n)
+    idx <- which(keep & nzchar(phone))
+    d[idx] <- duplicated(phone[idx])
+    remove_step(step, d)
+    rm(d, idx)
+  }
+
+  cat(sprintf("  Removed - %-28s %s\n",
+              STEP_LABEL[[step]], format(counts[[step]], big.mark = ",")))
+}
+
+#===============================================================
+# PASS 2 - WRITE GOOD AND BAD FILES (streamed)
+#
+# GOOD: record exactly as read
+# BAD:  [2-digit reason code][space][original record]
+#===============================================================
+cat("\nPass 2: writing GOOD and BAD files...\n")
+
+write_split <- function(path_in, path_good, path_bad, keep_vec, code_vec, n_expected) {
+  con_in   <- file(path_in,   "r")
+  con_good <- file(path_good, "w")
+  con_bad  <- file(path_bad,  "w")
+  on.exit({ close(con_in); close(con_good); close(con_bad) }, add = TRUE)
+  pos <- 0
+  repeat {
+    ln <- readLines(con_in, n = CHUNK_REC, warn = FALSE, encoding = "latin1")
+    if (length(ln) == 0L) break
+    idx <- pos + seq_along(ln)
+    k   <- keep_vec[idx]
+    writeLines(ln[k], con_good, useBytes = TRUE)
+    if (any(!k)) {
+      writeLines(paste0(code_vec[idx][!k], " ", ln[!k]), con_bad, useBytes = TRUE)
+    }
+    pos <- pos + length(ln)
+    cat("\r  Records processed:", format(pos, big.mark = ","))
+  }
+  cat("\n")
+  if (pos != n_expected) stop("Record count changed between pass 1 and pass 2.")
+  invisible(pos)
+}
+
+write_split(fw_file, good_file, bad_file, keep, reason_code, n)
+
+#===============================================================
+# SUMMARY
+#===============================================================
+fmt <- function(x) format(x, big.mark = ",", scientific = FALSE)
+
+step_lines <- vapply(STEP_ORDER, function(s) {
+  sprintf("  %s  %-28s %s", STEP_CODE[[s]], STEP_LABEL[[s]],
+          if (is.na(counts[[s]])) "not run" else fmt(counts[[s]]))
+}, "")
+
+summary_txt <- c(
+  "SAMPCLEN SUMMARY",
+  "-------------------------------------",
+  paste0("Input File:    ", fw_file),
+  paste0("Layout:        ", layout_file),
+  paste0("Phone Field:   ", layout_df$FieldName[ph_idx], " (", ph_start, "-", ph_end, ")"),
+  "",
+  paste0("Records In:    ", fmt(n)),
+  paste0("GOOD Records:  ", fmt(sum(keep))),
+  paste0("BAD Records:   ", fmt(sum(!keep))),
+  "",
+  "BAD records by reason code (first reason counted):",
+  step_lines,
+  "",
+  paste0("GOOD File:     ", good_file),
+  paste0("BAD File:      ", bad_file),
+  "BAD records start with: [code][space][original record]"
+)
+
+cat("\n=====================================\n")
+cat(paste(summary_txt, collapse = "\n"), "\n")
+cat("=====================================\n")
+
+show_msg("SampClen - Complete", paste(summary_txt, collapse = "\n"))
