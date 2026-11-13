@@ -1,2 +1,2 @@
-# my-firsrt-one
+# my-first-one
 seeing how this work
